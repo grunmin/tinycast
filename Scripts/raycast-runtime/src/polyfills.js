@@ -331,8 +331,12 @@ class TinycastResponse {
     return this._stream;
   }
   clone() {
+    // A live body has exactly one reader; a copy would have to tee it, which this runtime does not.
+    if (this._bytes === null) {
+      throw new TypeError("Cannot clone a Response whose body is still streaming.");
+    }
     const { status, statusText, headers } = this;
-    return new TinycastResponse(this._bytes ?? this._stream, { status, statusText, headers }, this.url);
+    return new TinycastResponse(this._bytes, { status, statusText, headers }, this.url);
   }
   async arrayBuffer() {
     this.bodyUsed = true;
@@ -376,19 +380,208 @@ class TinycastRequest {
   }
 }
 
+// ─── progressive responses ──────────────────────────────────────────
+// Server-sent events are the one reply that has to arrive while it is still being written. A request
+// that signals it wants one — `"stream": true` in its JSON body, or an `Accept` naming SSE — asks the
+// host to `begin` instead of `request`: that settles with the response head, and every body chunk then
+// comes back through `__tinycast.fetchChunk`. The extension reads `response.body` as it fills.
+//
+// The head alone decides the shape handed back. A `text/event-stream` reply becomes a live `Response`;
+// anything else (a JSON error from the same endpoint, say) is collected into the whole body the
+// one-shot path would have returned, so nothing but SSE changes behaviour.
+
+const liveStreams = new Map();
+/// Chunks that beat the head back. Swift can push a body chunk before the settle naming the stream
+/// reaches this queue, so the first ones wait here until `beginStreamingFetch` claims them.
+const earlyChunks = new Map();
+/// Ids torn down on purpose, so a chunk still in flight is dropped instead of reopening an entry.
+const cancelledStreams = new Set();
+
+function isEventStream(headers) {
+  const type = headers?.["content-type"];
+  return typeof type === "string" && type.toLowerCase().includes("text/event-stream");
+}
+
+/// Whether this request may get a progressive reply. Only these leave the one-shot path.
+function wantsStreaming(request) {
+  const accept = request.headers.get("accept");
+  if (typeof accept === "string" && accept.toLowerCase().includes("text/event-stream")) return true;
+  if (typeof request.body !== "string") return false;
+  // Cheap guard: only JSON bodies this small are parsed just to find the flag.
+  if (request.body.length > 1 << 20) return false;
+  try {
+    const parsed = JSON.parse(request.body);
+    return parsed !== null && typeof parsed === "object" && parsed.stream === true;
+  } catch {
+    return false;
+  }
+}
+
+function streamEntry(controller, release) {
+  return {
+    release,
+    fail(reason) {
+      try {
+        controller.error(reason);
+      } catch {
+        // Already closed by the host; the cancellation still happened.
+      }
+    },
+    receive(base64, done, message) {
+      if (base64) {
+        try {
+          controller.enqueue(base64ToBytes(base64));
+        } catch (error) {
+          log("error", ["fetch chunk:", String(error)]);
+        }
+      }
+      if (!done) return;
+      if (message) controller.error(new Error(String(message)));
+      else controller.close();
+    },
+  };
+}
+
+function bufferedEntry(resolve, reject, release) {
+  const chunks = [];
+  return {
+    release,
+    fail: reject,
+    receive(base64, done, message) {
+      if (base64) chunks.push(base64ToBytes(base64));
+      if (!done) return;
+      if (message) reject(new Error(String(message)));
+      else resolve(concatBytes(chunks));
+    },
+  };
+}
+
+/// Drops a stream and tells the host to stop the transfer.
+function cancelStream(id, reason) {
+  const entry = liveStreams.get(id);
+  liveStreams.delete(id);
+  earlyChunks.delete(id);
+  entry?.release?.();
+  entry?.fail?.(reason ?? abortError());
+  cancelledStreams.add(id);
+  hostCall("fetch", "cancel", [id]).catch(() => {});
+}
+
+/// Closes a stream for good: the host pushes nothing else for this id, so the listener goes with it.
+function finishStream(id, entry, base64, message) {
+  liveStreams.delete(id);
+  entry.receive(base64, true, message);
+  entry.release?.();
+}
+
+/// Takes ownership of a stream's id and replays whatever arrived before the head did.
+function claimStream(id, entry) {
+  liveStreams.set(id, entry);
+  const queued = earlyChunks.get(id);
+  if (!queued) return;
+  earlyChunks.delete(id);
+  for (const [base64, done, message] of queued) {
+    if (!liveStreams.has(id)) return;
+    if (done) {
+      finishStream(id, entry, base64, message);
+      return;
+    }
+    entry.receive(base64, false, message);
+  }
+}
+
+export function deliverFetchChunk(id, base64, done, message) {
+  const key = String(id);
+  const entry = liveStreams.get(key);
+  if (!entry) {
+    if (cancelledStreams.has(key)) {
+      if (done) cancelledStreams.delete(key);
+      return;
+    }
+    const queued = earlyChunks.get(key);
+    if (queued) queued.push([base64, done, message]);
+    else earlyChunks.set(key, [[base64, done, message]]);
+    return;
+  }
+  if (done) finishStream(key, entry, base64, message);
+  else entry.receive(base64, false, message);
+}
+
+async function beginStreamingFetch(request, spec, signal) {
+  let aborted = false;
+  let streamId = null;
+  // Registered before the head is asked for: an abort that lands while `begin` is in flight has to
+  // win, exactly as the one-shot path's own check does.
+  const onAbort = () => {
+    aborted = true;
+    if (streamId !== null) cancelStream(streamId, abortError());
+  };
+  signal?.addEventListener?.("abort", onAbort, { once: true });
+  const release = () => signal?.removeEventListener?.("abort", onAbort);
+
+  let began = null;
+  try {
+    began = await hostCall("fetch", "begin", [spec]);
+  } catch (error) {
+    release();
+    log("log", ["fetch begin:", String(error)]);
+    // Never a fallback: the request may already have reached the server, and a retry could run a
+    // non-idempotent request twice.
+    throw error;
+  }
+  if (!began || began.id === undefined) {
+    // The host cannot stream this request — it says so before touching the network.
+    release();
+    return null;
+  }
+
+  streamId = String(began.id);
+  const head = { status: began.status, statusText: began.statusText, headers: began.headers };
+  const url = began.url || request.url;
+
+  if (aborted || signal?.aborted) {
+    release();
+    cancelStream(streamId, abortError());
+    throw abortError();
+  }
+
+  if (!isEventStream(began.headers)) {
+    const bytes = await new Promise((resolve, reject) => {
+      claimStream(streamId, bufferedEntry(resolve, reject, release));
+    });
+    if (aborted || signal?.aborted) throw abortError();
+    return new TinycastResponse(bytes, head, url);
+  }
+
+  const stream = new ReadableStream({
+    start(sink) {
+      claimStream(streamId, streamEntry(sink, release));
+    },
+    cancel() {
+      cancelStream(streamId);
+    },
+  });
+  return new TinycastResponse(stream, head, url);
+}
+
 async function tinycastFetch(input, init = {}) {
   const request = input instanceof TinycastRequest ? input : new TinycastRequest(input, init);
   const signal = init.signal || request.signal;
   if (signal?.aborted) throw abortError();
 
-  const raw = await hostCall("fetch", "request", [
-    {
-      url: request.url,
-      method: request.method,
-      headers: request.headers.toJSON(),
-      bodyBase64: encodeBody(request.body),
-    },
-  ]);
+  const spec = {
+    url: request.url,
+    method: request.method,
+    headers: request.headers.toJSON(),
+    bodyBase64: encodeBody(request.body),
+  };
+
+  if (wantsStreaming(request)) {
+    const streamed = await beginStreamingFetch(request, spec, signal);
+    if (streamed) return streamed;
+  }
+
+  const raw = await hostCall("fetch", "request", [spec]);
   if (signal?.aborted) throw abortError();
   return new TinycastResponse(
     base64ToBytes(raw.bodyBase64 || ""),

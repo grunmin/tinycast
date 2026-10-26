@@ -101,10 +101,64 @@ enum ExtensionFetchTests {
             try await sharedRequests(url, stateFile: stateFile)
             let sharedReleased = await waitForState(stateFile) { $0.closed == $0.opened }
             expect(sharedReleased, "shared transport closes its connections when its owner releases it")
+            try await streamingCheck(url: url, stateFile: stateFile, directory: directory)
             try await socketChecks(in: directory)
         } catch {
             expect(false, "HTTP fixture: \(error)")
         }
+    }
+
+    /// End to end: the fixture server holds the second event back until the extension has read the
+    /// first, so a body that only arrives once the reply is finished can never pass this check.
+    /// The gate is the file the fixture waits on, which it derives from its own state path.
+    private static func streamingCheck(url: String, stateFile: URL, directory: URL) async throws {
+        let gate = URL(fileURLWithPath: stateFile.path + ".gate")
+        let (runtime, host, recorder) = ExtensionTests.makeRuntime()
+        defer { runtime.shutdown() }
+        try await runtime.boot(config: .current(supportDirectory: directory))
+        let code = """
+            exports.default = async () => {
+              const fs = require("fs"), assert = require("assert");
+              const api = require("@raycast/api");
+              const ascii = (bytes) => Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+              const response = await fetch("\(url)/sse", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+                body: JSON.stringify({ stream: true }),
+              });
+              assert.equal(response.status, 200);
+              assert.equal(response.headers.get("content-type"), "text/event-stream");
+              const reader = response.body.getReader();
+              const first = ascii((await reader.read()).value);
+              fs.writeFileSync(api.getPreferenceValues().gate, "go");
+              const second = ascii((await reader.read()).value);
+              const end = await reader.read();
+              assert.equal(first, "data: first\\n\\n");
+              assert.equal(second, "data: second\\n\\n");
+              assert.equal(end.done, true);
+              await api.showHUD(first.trim() + "|" + second.trim());
+            };
+            """
+        await runtime.start(
+            session: "sse", code: code, file: directory.appendingPathComponent("sse.js"),
+            mode: .noView,
+            context: ExtensionTests.launchContext(
+                mode: .noView, preferences: ["gate": .string(gate.path)]))
+        // Longer than the fixture's own 5 s fallback, so a stalled body is observed rather than cut.
+        for _ in 0..<450 {
+            if recorder.finished || !recorder.failures.isEmpty { break }
+            await ExtensionTests.settle(20)
+        }
+        expect(
+            recorder.finished,
+            "an SSE command finishes instead of waiting on a body that never arrives")
+        expect(
+            recorder.failures.isEmpty,
+            "an SSE command finishes without failing: \(recorder.failures.joined(separator: " | "))")
+        expect(
+            host.huds == ["data: first|data: second"],
+            "JavaScriptCore reads an SSE body chunk by chunk: \(host.huds)")
+        await runtime.stop(session: "sse")
     }
 
     private static func socketChecks(in directory: URL) async throws {

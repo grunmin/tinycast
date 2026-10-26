@@ -20,6 +20,9 @@ produces, rendered natively into the palette. No Electron, no browser, no Node.j
 - **Bridges share one private HTTP transport, never execution state.** Cookies, credential storage and
   URL caching are disabled. Individual task cancellation leaves other requests running; releasing the
   fetcher invalidates its session so CFNetwork does not retain discarded connections and sessions.
+  A streaming reply is the exception: it opens its own ephemeral session, because URLSession only
+  delivers body chunks to a delegate, and that session is invalidated when its task completes — the
+  same cookie, credential and cache exclusions apply.
 - **An idle menu item holds no JavaScript.** Once `isLoading` clears, keep only the native button and
   its snapshot. Reload a fresh context when its menu opens; retain it until the menu closes and any
   asynchronous action and host calls finish. Never keep a context alive to preserve handlers.
@@ -106,7 +109,8 @@ Two host-call flavours:
 
 - **Async** (`invoke`) for anything that needs the main actor — clipboard, toasts, window control,
   `fetch`, `exec`. Swift answers later through `__tinycast.settle`, so the JS thread never blocks on the
-  UI.
+  UI. A streaming `fetch` answers twice: `fetch.begin` settles with the response head, then
+  `__tinycast.fetchChunk` pushes each body chunk.
 - **Blocking** (`invokeSync`) for the synchronous Node shims only — `fs.readFileSync`,
   `execSync`, `createHash`, `gunzipSync`. Safe because Swift services these entirely on the JS queue;
   nothing there touches the main actor, so a blocking answer cannot deadlock.
@@ -724,9 +728,22 @@ error.
 **Streams** — the stream core is Node's real contract, not a stand-in: an extension that ships
 `stream-chain` and `stream-json` to walk a package index builds object-mode pipelines out of it, and
 `Homebrew` is the reference case. `fetch` responses expose `body` as a `ReadableStream`, so
-`pipeThrough` → `Readable.fromWeb` → `pipeline` → `fs.createWriteStream` works end to end. The bytes
-have already arrived by then, though: the "stream" hands out a buffered response in reader-sized
-pieces, so a progress callback reports how much has been written, never how much has been received.
+`pipeThrough` → `Readable.fromWeb` → `pipeline` → `fs.createWriteStream` works end to end.
+
+A reply is live only when it is server-sent events. A request that signals it wants one — `"stream":
+true` in its JSON body, or an `Accept` naming `text/event-stream` — goes over `fetch.begin` instead of
+`fetch.request`: that settles as soon as the headers are in, and each body chunk reaches `response.body`
+as `URLSession` delivers it, so an extension renders a model's answer while it is still being written.
+The response's own `Content-Type` decides the shape handed back — only `text/event-stream` becomes a
+live `Response`; a JSON error from the same endpoint is collected into the whole body the one-shot path
+would have returned. Everything else is buffered as before, so a progress callback reports how much has
+been written, never how much has been received. Nothing carries backpressure onto the socket: chunks
+queue in the runtime's `ReadableStream`, and `http.request` never streams.
+
+A `begin` the host refuses before touching the network (a malformed URL, a Unix socket) falls back to
+the one-shot request; a `begin` that fails once the request is on the wire does not, because a retry
+could run a non-idempotent request twice — the caller sees the failure instead.
+
 One shortcut inside `Transform`: it acknowledges a write as soon as `_transform` calls back rather
 than waiting for room on its readable side, so only a transform nobody reads from can grow unbounded.
 
@@ -821,7 +838,7 @@ extensions / 114 of 147 view commands** boot and render. `Scripts/raycast-runtim
 | **Aborting a `fetch` already in flight**                     | `AbortSignal` is complete — `timeout`, `abort` and `any` included — and `fetch` checks it on both sides of the host call, so a caller gets its `AbortError`. The request itself still runs to completion: the signal isn't carried across the bridge, so nothing cancels the `URLSessionTask`. A timeout bounds the caller, not the network. |
 | **Interactive `spawn` stdin**                                | stdout and stderr stream, but stdin is sent once as the child starts: whatever was written in the same tick. A later `stdin.write` is dropped.                                                                                                                                                                                               |
 | **`net` / `tls`**                                            | Resolve but throw on use. Nothing bridges a raw socket; a bundled `ws` reaches the network through the WebSocket bridge instead. `tls.TLSSocket` is the one exception: `http2-wrapper`, inside `got`, derives a class from one at import time, so it constructs as an inert duplex.                                                          |
-| **Streaming HTTP**                                           | The bridge answers a request with the whole body at once, so `http.request` delivers one chunk and `Response.body` replays bytes that already arrived. Server-sent events, network-level progress and backpressure onto the socket are all out of reach; `stream` itself is real enough to carry them the day the bridge is.                 |
+| **Streaming HTTP**                                           | Only `fetch` streams, and only server-sent events: `http.request` delivers one chunk, and a reply that isn't `text/event-stream` is buffered whole. Backpressure never reaches the socket — chunks queue in the runtime's `ReadableStream` — so a fast server and a slow reader both fit in memory.                                                                                                              |
 | **Tool/AI-extension entry points (`tools/`)**                | Not surfaced.                                                                                                                                                                                                                                                                                                                                |
 
 ## Working on the runtime

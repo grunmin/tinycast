@@ -14,6 +14,24 @@ const server = http.createServer((request, response) => {
     save();
     return;
   }
+  // Server-sent events, held open until the extension proves it read the first one: a buffered
+  // transport never resolves the fetch, so the gate file is never written and the reply times out.
+  if (request.url === "/sse") {
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+    });
+    response.write("data: first\n\n");
+    const gate = `${file}.gate`;
+    const opened = Date.now();
+    const tick = setInterval(() => {
+      if (!fs.existsSync(gate) && Date.now() - opened < 5000) return;
+      clearInterval(tick);
+      response.write("data: second\n\n");
+      response.end();
+    }, 20);
+    return;
+  }
   const respond = () => {
     response.writeHead(200, {
       "Content-Type": "application/json",

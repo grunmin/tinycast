@@ -28,6 +28,8 @@ final class ExtensionRuntime: @unchecked Sendable {
     private var generation = UUID()
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
     private let nodeShims = ExtensionNodeShims()
+    /// Progressive fetches in flight; chunks are pushed into the context as they arrive.
+    private let streams = ExtensionFetchStreamRegistry()
 
     /// Set once at startup; read on the JS queue, so it is written before the runtime ever boots.
     private nonisolated(unsafe) weak var delegate: ExtensionRuntimeDelegate?
@@ -240,10 +242,23 @@ final class ExtensionRuntime: @unchecked Sendable {
     // MARK: - Host call plumbing
 
     private func invokeAsync(callId: String, api: String, method: String, argsJSON: String) {
+        let generation = self.generation
+        // A streaming fetch answers twice — once for the head, then once per chunk — so it never
+        // reaches `hostAPI.perform`, which answers exactly once.
+        if api == "fetch", method == "begin" {
+            beginFetchStream(callId: callId, generation: generation, argsJSON: argsJSON)
+            return
+        }
+        if api == "fetch", method == "cancel" {
+            let cancelled = RenderValue.arguments(from: argsJSON)
+            if let id = cancelled.first?.stringValue { streams.cancel(id) }
+            settleQuietly(callId: callId, generation: generation, payload: "null")
+            return
+        }
+
         // Decode to `RenderValue` here so only `Sendable` values reach the main actor.
         let arguments = RenderValue.arguments(from: argsJSON)
         let hostAPI = self.hostAPI
-        let generation = self.generation
         hostTasks[callId] = Task { @MainActor [weak self] in
             guard !Task.isCancelled else { return }
             do {
@@ -266,15 +281,102 @@ final class ExtensionRuntime: @unchecked Sendable {
                 self.hostTasks[callId] = nil
                 _ = self.context?.objectForKeyedSubscript("__tinycast")?
                     .invokeMethod("settle", withArguments: [callId, ok, payload])
-                if self.hostTasks.isEmpty { self.resumeIdleWaiters() }
+                if self.isIdle { self.resumeIdleWaiters() }
             }
         }
     }
 
+    /// Starts a progressive fetch, then settles `callId` with the response head. Body chunks reach
+    /// the context through `pushFetchChunk` until the stream closes.
+    ///
+    /// A spec this path cannot carry (a malformed URL, a Unix socket) answers `null` before touching
+    /// the network, which is the one case the JS side retries over the buffered request. A failure
+    /// once the request is on the wire is *not* retried: the server may already have run it.
+    private func beginFetchStream(callId: String, generation: UUID, argsJSON: String) {
+        let arguments = RenderValue.arguments(from: argsJSON)
+        let spec = arguments.first
+        guard let (request, socketPath) = try? ExtensionFetcher.makeRequest(spec), socketPath == nil
+        else {
+            settleQuietly(callId: callId, generation: generation, payload: "null")
+            return
+        }
+        // Tracked like any other host call, so `drainHostCalls` waits for the head. `settle` clears
+        // the entry from this queue, which is the queue this method already runs on.
+        hostTasks[callId] = Task { [weak self] in
+            // Shutdown cancels host tasks; a stream that has not started yet must not open one.
+            guard let self, !Task.isCancelled else { return }
+            var opened: String?
+            do {
+                let id = UUID().uuidString
+                let stream = ExtensionFetchStream(
+                    id: id,
+                    request: request,
+                    onChunk: { [weak self] data in
+                        self?.pushFetchChunk(
+                            id: id, generation: generation, data: data, done: false, message: nil)
+                    },
+                    onFinish: { [weak self] message in
+                        self?.pushFetchChunk(
+                            id: id, generation: generation, data: nil, done: true, message: message)
+                    })
+                streams.insert(stream)
+                opened = id
+                let head = try await stream.start()
+                let json =
+                    (try? JSONSerialization.data(withJSONObject: head))
+                    .flatMap { String(data: $0, encoding: .utf8) } ?? "null"
+                await self.settle(callId: callId, generation: generation, ok: true, payload: json)
+            } catch {
+                // A stream that never produced headers must not stay registered, and the caller gets
+                // the failure rather than a second request.
+                if let opened { self.streams.remove(opened) }
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                await self.settle(
+                    callId: callId, generation: generation, ok: false, payload: message)
+            }
+        }
+    }
+
+    /// One chunk, or the close, on the JS queue that owns the context.
+    private func pushFetchChunk(
+        id: String, generation: UUID, data: Data?, done: Bool, message: String?
+    ) {
+        queue.async {
+            // A stream outlives the session that opened it only until `cancelAll`; never feed its
+            // tail into the next session's context.
+            guard generation == self.generation else { return }
+            let base64 = data?.base64EncodedString() ?? ""
+            _ = self.context?.objectForKeyedSubscript("__tinycast")?
+                .invokeMethod("fetchChunk", withArguments: [id, base64, done, message ?? ""])
+            if done {
+                self.streams.remove(id)
+                if self.isIdle { self.resumeIdleWaiters() }
+            }
+        }
+    }
+
+    /// A host call with nothing to hand back (the JS side fires these and forgets them).
+    private func settleQuietly(callId: String, generation: UUID, payload: String) {
+        queue.async {
+            // Call ids restart with each context, so a reply from an old one would land on a
+            // different caller's promise.
+            guard generation == self.generation else { return }
+            self.hostTasks[callId] = nil
+            _ = self.context?.objectForKeyedSubscript("__tinycast")?
+                .invokeMethod("settle", withArguments: [callId, true, payload])
+            if self.isIdle { self.resumeIdleWaiters() }
+        }
+    }
+
+    /// Nothing is outstanding: no host call is pending, and no progressive fetch is still filling.
+    /// A stream holds the context the way a buffered fetch used to, so a menu session cannot be torn
+    /// down while an extension is still reading its body.
+    private var isIdle: Bool { hostTasks.isEmpty && streams.isEmpty }
+
     func drainHostCalls() async {
         await withCheckedContinuation { continuation in
             queue.async {
-                if self.hostTasks.isEmpty {
+                if self.isIdle {
                     continuation.resume()
                 } else {
                     self.idleWaiters.append(continuation)
@@ -335,6 +437,7 @@ final class ExtensionRuntime: @unchecked Sendable {
         let hostAPI = self.hostAPI
         Task { @MainActor in hostAPI.sessionEnded() }
         queue.async {
+            self.streams.cancelAll()
             for timer in self.timers.values { timer.cancel() }
             self.timers.removeAll()
             for task in self.hostTasks.values { task.cancel() }

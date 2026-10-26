@@ -7,7 +7,7 @@ import { createElement } from "react";
 import * as React from "react";
 import * as JSXRuntime from "react/jsx-runtime";
 import { describeError, log, settle } from "./host.js";
-import { fireTimer, setUncaughtHandler } from "./polyfills.js";
+import { deliverFetchChunk, fireTimer, setUncaughtHandler } from "./polyfills.js";
 import { configureNodeShims } from "./node-shims.js";
 import { defineModule, evaluateCommonJS } from "./modules.js";
 import { resolveComponent } from "./async-component.js";
@@ -178,6 +178,12 @@ globalThis.__tinycast = {
 
   settle,
   fireTimer,
+
+  /// One body chunk of a streaming `fetch`, pushed from Swift. `done` closes or fails the stream.
+  fetchChunk(id, base64, done, message) {
+    deliverFetchChunk(id, base64, done, message);
+    return "ok";
+  },
   runToastAction,
 
   stop(sessionId) {

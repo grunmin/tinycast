@@ -1101,11 +1101,415 @@ export async function runFixtures() {
     },
   );
 
+  // A streamed reply is the one shape that must be readable while it is still being written: the
+  // host answers `fetch.begin` with the head, pushes chunks, and the extension reads `response.body`.
+  const base64Text = (text) => Buffer.from(text, "utf8").toString("base64");
+  const sseEvents = ['data: {"delta":"Hel"}\n\n', 'data: {"delta":"lo"}\n\n', "data: [DONE]\n\n"];
+  const sseHead = {
+    id: "sse-1",
+    status: 200,
+    statusText: "OK",
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+    url: "https://example.test/chat",
+  };
+
+  await run(
+    "fetch streams a server-sent event body",
+    `
+import { showHUD } from "@raycast/api";
+
+const ascii = (bytes) => Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+
+export default async function Command() {
+  const response = await fetch("https://example.test/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify({ stream: true, messages: [] }),
+  });
+  globalThis.__head = {
+    status: response.status,
+    type: response.headers.get("Content-Type"),
+    url: response.url,
+    seen: [],
+  };
+  const reader = response.body.getReader();
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    globalThis.__head.seen.push(ascii(value));
+  }
+  globalThis.__text = globalThis.__head.seen.join("");
+  await showHUD("streamed");
+}
+`,
+    "no-view",
+    async (harness) => {
+      const head = harness.call("globalThis.__head");
+      check(
+        "asks the host to begin instead of buffering one body",
+        harness.state.hostCalls.includes("fetch.begin") && !harness.state.hostCalls.includes("fetch.request"),
+        harness.state.hostCalls.join(", "),
+      );
+      check(
+        "the head is back before any of the body is",
+        head?.status === 200 && head?.type === "text/event-stream; charset=utf-8" && head.seen.length === 0,
+        JSON.stringify(head),
+      );
+      harness.call(`__tinycast.fetchChunk("sse-1", "${base64Text(sseEvents[0])}", false, "")`);
+      await wait(10);
+      const first = harness.call("globalThis.__head").seen;
+      check(
+        "the first event is readable while the rest is still in flight",
+        first.length === 1 && first[0].includes("Hel"),
+        JSON.stringify(first),
+      );
+      harness.call(`__tinycast.fetchChunk("sse-1", "${base64Text(sseEvents[1])}", false, "")`);
+      await wait(10);
+      harness.call(`__tinycast.fetchChunk("sse-1", "${base64Text(sseEvents[2])}", true, "")`);
+      await wait(20);
+      check(
+        "every event arrives in order and the stream closes",
+        harness.call("globalThis.__text") === sseEvents.join(""),
+        JSON.stringify(harness.call("globalThis.__text")),
+      );
+      check("the command finishes after the stream closes", harness.state.hostCalls.includes("feedback.showHUD"));
+    },
+    { stubs: { "fetch.begin": () => sseHead }, settle: 40 },
+  );
+
+  await run(
+    "a chunk that beats the head is kept",
+    `
+const ascii = (bytes) => Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+
+export default async function Command() {
+  // Swift pushes body chunks the moment they land, which can be before the settle naming the
+  // stream reaches this queue.
+  globalThis.__tinycast.fetchChunk("early-1", "${base64Text("data: first\n\n")}", false, "");
+  const response = await fetch("https://example.test/events", {
+    headers: { Accept: "text/event-stream" },
+  });
+  const { value } = await response.body.getReader().read();
+  globalThis.__first = ascii(value);
+}
+`,
+    "no-view",
+    async (harness) => {
+      check(
+        "the early chunk leads the body instead of being dropped",
+        harness.call("globalThis.__first") === "data: first\n\n",
+        JSON.stringify(harness.call("globalThis.__first")),
+      );
+    },
+    {
+      stubs: { "fetch.begin": () => ({ ...sseHead, id: "early-1" }) },
+      settle: 40,
+    },
+  );
+
+  await run(
+    "a reply that is not SSE keeps its one-shot shape",
+    `
+export default async function Command() {
+  const response = await fetch("https://example.test/chat", {
+    method: "POST",
+    body: JSON.stringify({ stream: true }),
+  });
+  globalThis.__reply = {
+    status: response.status,
+    type: response.headers.get("Content-Type"),
+    body: await response.json(),
+  };
+}
+`,
+    "no-view",
+    async (harness) => {
+      check("the caller is still waiting on the whole body", harness.call("globalThis.__reply") === undefined);
+      harness.call(`__tinycast.fetchChunk("json-1", "${base64Text('{"error":"slow down"}')}", false, "")`);
+      await wait(10);
+      harness.call(`__tinycast.fetchChunk("json-1", "", true, "")`);
+      await wait(20);
+      const reply = harness.call("globalThis.__reply");
+      check(
+        "a JSON error is handed back whole, status and headers intact",
+        reply?.status === 429 && reply?.type === "application/json" && reply?.body?.error === "slow down",
+        JSON.stringify(reply),
+      );
+    },
+    {
+      stubs: {
+        "fetch.begin": () => ({
+          id: "json-1",
+          status: 429,
+          statusText: "Too Many Requests",
+          headers: { "content-type": "application/json" },
+          url: "https://example.test/chat",
+        }),
+      },
+      settle: 40,
+    },
+  );
+
+  await run(
+    "a stream that fails mid-body rejects the reader",
+    `
+const ascii = (bytes) => Array.from(bytes, (byte) => String.fromCharCode(byte)).join("");
+
+export default async function Command() {
+  const response = await fetch("https://example.test/events", {
+    headers: { Accept: "text/event-stream" },
+  });
+  const reader = response.body.getReader();
+  globalThis.__chunks = [ascii((await reader.read()).value)];
+  try {
+    await reader.read();
+    globalThis.__after = "no error";
+  } catch (error) {
+    globalThis.__after = error.message;
+  }
+}
+`,
+    "no-view",
+    async (harness) => {
+      harness.call(`__tinycast.fetchChunk("sse-1", "${base64Text("data: one\n\n")}", false, "")`);
+      await wait(10);
+      harness.call(`__tinycast.fetchChunk("sse-1", "", true, "connection lost")`);
+      await wait(20);
+      check(
+        "the bytes already delivered survive the failure",
+        JSON.stringify(harness.call("globalThis.__chunks")) === JSON.stringify(["data: one\n\n"]),
+        JSON.stringify(harness.call("globalThis.__chunks")),
+      );
+      check(
+        "a failed body rejects the next read instead of ending it",
+        harness.call("globalThis.__after") === "connection lost",
+        String(harness.call("globalThis.__after")),
+      );
+    },
+    { stubs: { "fetch.begin": () => sseHead }, settle: 40 },
+  );
+
+  const fallbackCalls = [];
+  await run(
+    "a host that cannot begin falls back to the buffered request",
+    `
+export default async function Command() {
+  const response = await fetch("https://example.test/chat", {
+    method: "POST",
+    body: JSON.stringify({ stream: true }),
+  });
+  globalThis.__fallback = { status: response.status, body: await response.json() };
+}
+`,
+    "no-view",
+    async (harness) => {
+      const fallback = harness.call("globalThis.__fallback");
+      check(
+        "a host that cannot stream still returns the response",
+        fallback?.status === 200 && fallback?.body?.ok === true,
+        JSON.stringify(fallback),
+      );
+      check(
+        "the buffered request follows the refusal",
+        fallbackCalls.join(",") === "fetch.begin,fetch.request",
+        fallbackCalls.join(","),
+      );
+    },
+    {
+      stubs: {
+        "fetch.begin": () => {
+          fallbackCalls.push("fetch.begin");
+          return null;
+        },
+        "fetch.request": () => {
+          fallbackCalls.push("fetch.request");
+          return {
+            status: 200,
+            statusText: "OK",
+            headers: { "content-type": "application/json" },
+            url: "https://example.test/chat",
+            bodyBase64: base64Text('{"ok":true}'),
+          };
+        },
+      },
+      settle: 40,
+    },
+  );
+
+  const retried = [];
+  await run(
+    "a failed begin is not retried",
+    `
+export default async function Command() {
+  try {
+    await fetch("https://example.test/chat", {
+      method: "POST",
+      body: JSON.stringify({ stream: true }),
+    });
+    globalThis.__outcome = "resolved";
+  } catch (error) {
+    globalThis.__outcome = error.message;
+  }
+}
+`,
+    "no-view",
+    async (harness) => {
+      check(
+        "the failure reaches the caller",
+        String(harness.call("globalThis.__outcome")).includes("no response head"),
+        String(harness.call("globalThis.__outcome")),
+      );
+      check(
+        "the request is never sent a second time",
+        retried.join(",") === "fetch.begin",
+        retried.join(","),
+      );
+    },
+    {
+      stubs: {
+        "fetch.begin": () => {
+          retried.push("fetch.begin");
+          throw new Error("no response head");
+        },
+        "fetch.request": () => {
+          retried.push("fetch.request");
+          return { status: 200, statusText: "OK", headers: {}, url: "", bodyBase64: "" };
+        },
+      },
+      settle: 40,
+    },
+  );
+
+  await run(
+    "aborting while the head is in flight cancels the stream",
+    `
+export default async function Command() {
+  const controller = new AbortController();
+  const pending = fetch("https://example.test/events", {
+    method: "POST",
+    headers: { Accept: "text/event-stream" },
+    body: JSON.stringify({ stream: true }),
+    signal: controller.signal,
+  });
+  setTimeout(() => controller.abort(), 20);
+  try {
+    await pending;
+    globalThis.__abort = "resolved";
+  } catch (error) {
+    globalThis.__abort = error.name;
+  }
+}
+`,
+    "no-view",
+    async (harness) => {
+      await wait(200);
+      check(
+        "an abort that lands before the head still rejects the fetch",
+        harness.call("globalThis.__abort") === "AbortError",
+        String(harness.call("globalThis.__abort")),
+      );
+      check(
+        "and the stream the host opened is cancelled",
+        harness.state.hostCalls.includes("fetch.cancel"),
+        harness.state.hostCalls.join(", "),
+      );
+    },
+    {
+      stubs: {
+        "fetch.begin": () => new Promise((resolve) => setTimeout(() => resolve(sseHead), 60)),
+        "fetch.cancel": () => null,
+      },
+      settle: 120,
+    },
+  );
+
+  await run(
+    "a finished stream stops listening, and a live body refuses to be cloned",
+    `
+export default async function Command() {
+  const controller = new AbortController();
+  globalThis.__abortNow = () => controller.abort();
+  const response = await fetch("https://example.test/events", {
+    headers: { Accept: "text/event-stream" },
+    signal: controller.signal,
+  });
+  globalThis.__clone = "allowed";
+  try {
+    response.clone();
+  } catch (error) {
+    globalThis.__clone = error.name;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    chunks.push(Array.from(value, (byte) => String.fromCharCode(byte)).join(""));
+  }
+  globalThis.__body = chunks.join("");
+}
+`,
+    "no-view",
+    async (harness) => {
+      check(
+        "a live body refuses to be cloned",
+        harness.call("globalThis.__clone") === "TypeError",
+        String(harness.call("globalThis.__clone")),
+      );
+      harness.call(`__tinycast.fetchChunk("sse-1", "${base64Text("data: only\n\n")}", true, "")`);
+      await wait(20);
+      check(
+        "the body completes",
+        harness.call("globalThis.__body") === "data: only\n\n",
+        JSON.stringify(harness.call("globalThis.__body")),
+      );
+      const before = harness.state.hostCalls.filter((name) => name === "fetch.cancel").length;
+      harness.call("globalThis.__abortNow()");
+      await wait(20);
+      const after = harness.state.hostCalls.filter((name) => name === "fetch.cancel").length;
+      check("an abort after the body finished is not forwarded", after === before, `${before} -> ${after}`);
+    },
+    { stubs: { "fetch.begin": () => sseHead, "fetch.cancel": () => null }, settle: 40 },
+  );
+
+  await run(
+    "aborting a streamed body cancels the host request",
+    `
+export default async function Command() {
+  const controller = new AbortController();
+  const response = await fetch("https://example.test/events", {
+    headers: { Accept: "text/event-stream" },
+    signal: controller.signal,
+  });
+  const reader = response.body.getReader();
+  controller.abort();
+  try {
+    await reader.read();
+    globalThis.__body = "no error";
+  } catch (error) {
+    globalThis.__body = error.name;
+  }
+}
+`,
+    "no-view",
+    async (harness) => {
+      await wait(20);
+      check(
+        "the reader rejects once the caller aborts",
+        harness.call("globalThis.__body") === "AbortError",
+        String(harness.call("globalThis.__body")),
+      );
+      check("the host is told to stop the transfer", harness.state.hostCalls.includes("fetch.cancel"), harness.state.hostCalls.join(", "));
+      harness.call('__tinycast.fetchChunk("sse-1", "", true, "cancelled")');
+      check("a chunk for a cancelled stream is dropped", harness.state.failures.length === 0, harness.state.failures.join("|"));
+    },
+    { stubs: { "fetch.begin": () => sseHead, "fetch.cancel": () => null }, settle: 40 },
+  );
+
   const oauthTokens = new Map();
   const signIns = [];
   await run(
-    "OAuth.PKCEClient signs in and keeps a token set",
-    oauthSource,
+    "OAuth.PKCEClient signs in and keeps a token set",    oauthSource,
     "no-view",
     async (harness) => {
       const result = harness.call("globalThis.__oauth");

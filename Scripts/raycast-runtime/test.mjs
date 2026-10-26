@@ -309,6 +309,10 @@ async function stubHostCall(api, method, args) {
       return { name: "Finder", path: "/System/Library/CoreServices/Finder.app", bundleId: "com.apple.finder" };
     case "system.applications":
       return [];
+    // The harness never streams: answering `null` is the host saying it cannot, which makes `fetch`
+    // take the buffered request below instead of stubbing a live body here.
+    case "fetch.begin":
+      return null;
     case "fetch.request": {
       const spec = args[0];
       const response = await fetch(spec.url, {

@@ -31,7 +31,9 @@ final class ExtensionFetcher: Sendable {
         }
     }
 
-    func request(_ spec: RenderValue?) async throws -> [String: Any] {
+    /// The wire request a spec describes. The buffered and streaming paths share this, so both send
+    /// exactly what an extension asked for.
+    static func makeRequest(_ spec: RenderValue?) throws -> (URLRequest, socketPath: String?) {
         let fields = spec?.objectValue ?? [:]
         let urlString = fields["url"]?.stringValue ?? ""
         guard let url = URL(string: urlString), url.scheme != nil else {
@@ -47,10 +49,17 @@ final class ExtensionFetcher: Sendable {
         if let base64 = fields["bodyBase64"]?.stringValue, let body = Data(base64Encoded: base64) {
             request.httpBody = body
         }
+        let socketPath = fields["socketPath"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
+        return (request, socketPath)
+    }
+
+    func request(_ spec: RenderValue?) async throws -> [String: Any] {
+        let (request, socketPath) = try Self.makeRequest(spec)
+        let urlString = request.url?.absoluteString ?? ""
 
         let data: Data
         let response: URLResponse
-        if let socketPath = fields["socketPath"]?.stringValue, !socketPath.isEmpty {
+        if let socketPath {
             (data, response) = try await Self.socketResponse(for: request, socketPath: socketPath)
         } else {
             (data, response) = try await session.data(for: request)
@@ -254,5 +263,186 @@ enum ExtensionAsyncProcess {
         }
         entry.watchdog?.cancel()
         return result
+    }
+}
+
+/// One progressive HTTP response.
+///
+/// `start()` settles as soon as the headers are in, so the extension's `fetch` can hand back a
+/// `Response` whose body is still filling; every body chunk then reaches `onChunk` as URLSession
+/// delivers it, and `onFinish` closes the stream. This exists because the buffered path
+/// (`URLSession.data(for:)`) hands the extension one finished `Data`, which a caller reading
+/// `response.body` sees as a single chunk — no streaming render for an SSE reply.
+final class ExtensionFetchStream: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    let id: String
+
+    private let request: URLRequest
+    private let onChunk: @Sendable (Data) -> Void
+    private let onFinish: @Sendable (String?) -> Void
+
+    /// URLSession calls back on its own queue; the head settles there, the JS side hops itself.
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<[String: Any], Error>?
+    private var settled = false
+    private var cancelled = false
+    private var status = 200
+    private var headers: [String: String] = [:]
+    private var urlString = ""
+    private var session: URLSession?
+    private var task: URLSessionDataTask?
+
+    init(
+        id: String,
+        request: URLRequest,
+        onChunk: @escaping @Sendable (Data) -> Void,
+        onFinish: @escaping @Sendable (String?) -> Void
+    ) {
+        self.id = id
+        self.request = request
+        self.onChunk = onChunk
+        self.onFinish = onFinish
+        super.init()
+    }
+
+    /// Returns the response head; the body keeps arriving afterwards.
+    func start() async throws -> [String: Any] {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            self.continuation = continuation
+            lock.unlock()
+
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = 60
+            configuration.httpCookieStorage = nil
+            configuration.urlCredentialStorage = nil
+            configuration.urlCache = nil
+            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+            let session = URLSession(
+                configuration: configuration, delegate: self, delegateQueue: nil)
+            let task = session.dataTask(with: request)
+            // The registry holds this stream before the task exists, so a session can be torn down
+            // in between: cancel what is already cancelled, then resume either way so the head
+            // settles through the delegate path rather than hanging.
+            lock.lock()
+            self.session = session
+            self.task = task
+            let cancelledEarly = cancelled
+            lock.unlock()
+            if cancelledEarly { task.cancel() }
+            task.resume()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let task = self.task
+        lock.unlock()
+        task?.cancel()
+    }
+
+    // MARK: - URLSessionDataDelegate
+
+    func urlSession(
+        _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        let http = response as? HTTPURLResponse
+        var collected: [String: String] = [:]
+        for (key, value) in http?.allHeaderFields ?? [:] {
+            guard let name = key as? String, let text = value as? String else { continue }
+            collected[name.lowercased()] = text
+        }
+
+        lock.lock()
+        let isFirst = !settled
+        if isFirst {
+            settled = true
+            status = http?.statusCode ?? 200
+            headers = collected
+            urlString = response.url?.absoluteString ?? request.url?.absoluteString ?? ""
+        }
+        let pending = isFirst ? continuation : nil
+        if isFirst { self.continuation = nil }
+        let head = status
+        let headHeaders = headers
+        let headURL = urlString
+        lock.unlock()
+
+        if let pending {
+            pending.resume(
+                returning: [
+                    "id": id,
+                    "status": head,
+                    "statusText": HTTPURLResponse.localizedString(forStatusCode: head),
+                    "headers": headHeaders,
+                    "url": headURL
+                ])
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(
+        _ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data
+    ) {
+        onChunk(data)
+    }
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?
+    ) {
+        lock.lock()
+        let pending = settled ? nil : continuation
+        if !settled { settled = true }
+        self.continuation = nil
+        lock.unlock()
+
+        if let pending {
+            // No headers ever arrived: fail the call, and let the JS side fall back to buffering.
+            pending.resume(throwing: error ?? URLError(.badServerResponse))
+        } else {
+            onFinish(error?.localizedDescription)
+        }
+        session.finishTasksAndInvalidate()
+    }
+}
+
+/// Streaming fetches in flight, keyed by the id the JS side holds. URLSession's queue and the JS
+/// queue both reach it, so it carries its own lock.
+final class ExtensionFetchStreamRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var streams: [String: ExtensionFetchStream] = [:]
+
+    func insert(_ stream: ExtensionFetchStream) {
+        lock.lock()
+        streams[stream.id] = stream
+        lock.unlock()
+    }
+
+    func cancel(_ id: String) {
+        lock.lock()
+        let stream = streams.removeValue(forKey: id)
+        lock.unlock()
+        stream?.cancel()
+    }
+
+    func remove(_ id: String) {
+        lock.lock()
+        streams[id] = nil
+        lock.unlock()
+    }
+
+    var isEmpty: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return streams.isEmpty
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let all = Array(streams.values)
+        streams.removeAll()
+        lock.unlock()
+        for stream in all { stream.cancel() }
     }
 }
