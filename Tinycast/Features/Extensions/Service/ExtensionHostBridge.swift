@@ -14,6 +14,9 @@ protocol ExtensionHostContext: AnyObject {
     /// Every app bundle `getApplications()` reports, from the user's own search scopes.
     var applicationURLs: [URL] { get }
 
+    /// The shared injector, so `getSelectedText` can borrow a ⌘C when Accessibility yields nothing.
+    var textInjector: TextInjector? { get }
+
     func closeMainWindow(clearRootSearch: Bool)
     /// Bring the palette back after a command hid it — what `raycast://` means to an extension.
     func reopenPalette()
@@ -33,6 +36,10 @@ protocol ExtensionHostContext: AnyObject {
         fallbackText: String?, launchType: ExtensionLaunchType, launchContext: [String: RenderValue]
     ) throws
     func launch(_ link: ExtensionDeepLink) throws
+}
+
+extension ExtensionHostContext {
+    var textInjector: TextInjector? { nil }
 }
 
 struct ExtensionToast: Sendable, Equatable, Identifiable {
@@ -482,7 +489,7 @@ final class ExtensionHostBridge: ExtensionHostAPI {
             return describe(application: url)
 
         case "selectedText":
-            return try selectedText()
+            return try await selectedText()
 
         case "selectedFinderItems":
             return try finderSelection()
@@ -575,7 +582,12 @@ final class ExtensionHostBridge: ExtensionHostAPI {
     }
 
     /// Reads the app the palette displaced, never the system-wide focus.
-    private func selectedText() throws -> String {
+    ///
+    /// Chromium answers nothing once its window stops being key, which is exactly the window a
+    /// command opens over it — so this borrows a ⌘C through the shared injector, the way Quick
+    /// Actions already do, and resolves an empty string when nothing is selected (Raycast's contract)
+    /// instead of throwing.
+    private func selectedText() async throws -> String {
         guard Permissions.ensureAccessibility() else {
             throw ExtensionHostError.unsupported("getSelectedText without the Accessibility permission")
         }
@@ -583,10 +595,14 @@ final class ExtensionHostBridge: ExtensionHostAPI {
             target.processIdentifier != NSRunningApplication.current.processIdentifier
         else { throw ExtensionHostError.unsupported("getSelectedText (no target application)") }
 
-        guard let text = AccessibilityText.selection(in: target), !text.isEmpty else {
-            throw ExtensionHostError.unsupported("getSelectedText (no selection)")
+        if let text = AccessibilityText.selection(in: target), !text.isEmpty { return text }
+        if let injector = context?.textInjector,
+            let copied = await injector.copySelection(from: target),
+            !copied.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return copied
         }
-        return text
+        return ""
     }
 
     /// Joined on a linefeed, which Finder forbids in a name; a comma would split paths.

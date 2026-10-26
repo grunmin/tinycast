@@ -269,6 +269,7 @@ final class AppCore {
         textInjector = TextInjector(
             clipboardManager: clipboardManager,
             settings: settings)
+        extensions.textInjector = textInjector
         let noteSelectionKey = "notesActiveFileName"
         notesStore = NotesStore(
             repository: Self.notesRepository(for: settings),

@@ -884,6 +884,9 @@ final class ExtensionManager: ExtensionRuntimeDelegate, ExtensionHostContext {
         backgroundSessionID != nil ? .background : .userInitiated
     }
     var pasteTarget: NSRunningApplication? { coordinator?.pasteTarget }
+
+    /// Set from `AppCore` once the injector exists, so `getSelectedText` can borrow a ⌘C.
+    weak var textInjector: TextInjector?
     var applicationURLs: [URL] { coordinator?.applicationURLs ?? [] }
 
     func closeMainWindow(clearRootSearch: Bool) {
