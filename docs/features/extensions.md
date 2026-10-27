@@ -243,6 +243,11 @@ screens hold (see [palette.md](palette.md)).
   subtitle, but **not its accessories**: the API only advises an extension against sending them in
   this mode, and Raycast draws the ones it is sent, so suppressing them here would lose a row its
   whole signal. As in Raycast, they keep their full width and the title is what truncates.
+  The seam between the two is draggable: `ExtensionDetailSplit` owns the list's share of the pane and
+  `ExtensionDetailSplitHandle` the AppKit drag strip, with the fraction remembered in `UserDefaults`
+  (`extensionDetailSplitFraction`) rather than `settings.json`, since a pane width is geometry and not
+  a preference. It opens at 0.33, which leaves the detail the wider pane, a double-click resets it, and
+  Interface Size scales both minima without moving the proportion.
   `ExtensionScreen.Item`
   carries both the flat `selection` index and the scroll id, and is the `ForEach` identity of the row
   and the grid cell alike — see the scroll-id rule in [ui.md](../ui.md#rows-selection-hover).

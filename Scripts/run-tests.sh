@@ -641,6 +641,8 @@ run ext-form-test          $E/Model/ExtensionFormMetrics.swift \
                            Tests/ext-list-key-test.swift
 run ext-image-size-test   $E/Model/ExtensionImageSize.swift
 run ext-markdown-test      $E/Model/ExtensionMarkdown.swift
+run ext-detail-split-test  $E/Model/ExtensionDetailSplit.swift \
+                           $E/Service/ExtensionDetailSplitStore.swift
 run ext-accessory-test     $E/Model/RenderNode.swift \
                            $E/Model/ExtensionPickerItem.swift \
                            $E/Model/ExtensionSearchAccessory.swift \

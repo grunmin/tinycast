@@ -13,18 +13,40 @@ struct ExtensionListView: View {
     let onActivate: (Int) -> Void
     let onActions: (Int) -> Void
 
-    private static let detailListWidth: CGFloat = 290
+    private let splitStore: ExtensionDetailSplitStore
+    @State private var splitFraction: CGFloat
+    @State private var splitDragOrigin: CGFloat?
+
+    private static let splitHitWidth: CGFloat = 9
+
+    init(
+        screen: ExtensionScreen,
+        selection: Int,
+        assetsPath: String?,
+        scroll: ScrollIntent,
+        onSelect: @escaping (Int) -> Void,
+        onActivate: @escaping (Int) -> Void,
+        onActions: @escaping (Int) -> Void,
+        splitStore: ExtensionDetailSplitStore = ExtensionDetailSplitStore()
+    ) {
+        self.screen = screen
+        self.selection = selection
+        self.assetsPath = assetsPath
+        self.scroll = scroll
+        self.onSelect = onSelect
+        self.onActivate = onActivate
+        self.onActions = onActions
+        self.splitStore = splitStore
+        _splitFraction = State(initialValue: splitStore.fraction)
+    }
 
     var body: some View {
         Group {
             if screen.items.isEmpty {
                 emptyState
             } else if screen.showsDetail {
-                HStack(spacing: 0) {
-                    rowList
-                        .frame(width: metrics.scaled(Self.detailListWidth))
-                    Rectangle().fill(Theme.Colors.separator).frame(width: 1)
-                    detailPane
+                GeometryReader { geometry in
+                    splitBody(width: geometry.size.width)
                 }
             } else if case .grid(let layout) = screen.kind {
                 gridBody(layout: layout)
@@ -147,6 +169,52 @@ struct ExtensionListView: View {
             .thinScrollbar()
             .scrollFollowsSelection(
                 scroll, row: selectedRowID, atOrigin: selection < layout.columns, proxy: proxy)
+        }
+    }
+
+    /// The fraction is the list's share, so Interface Size moves both panes and never the ratio.
+    private func splitBody(width: CGFloat) -> some View {
+        let minimumList = metrics.scaled(ExtensionDetailSplit.minimumListWidth)
+        let minimumDetail = metrics.scaled(ExtensionDetailSplit.minimumDetailWidth)
+        let divider = Theme.Size.hairline
+        let listWidth = ExtensionDetailSplit(fraction: splitFraction).listWidth(
+            in: width, minimumList: minimumList, minimumDetail: minimumDetail, divider: divider)
+        let handleWidth = metrics.scaled(Self.splitHitWidth)
+        // Centred on the hairline, so the strip's slack lands in the panes' own gutters.
+        let handleX = listWidth + divider / 2 - handleWidth / 2
+        return HStack(spacing: 0) {
+            rowList
+                .frame(width: listWidth)
+            // The handle draws the hairline across this slot, so the two panes never touch.
+            Color.clear
+                .frame(width: divider)
+            detailPane
+        }
+        .overlay(alignment: .topLeading) {
+            ExtensionDetailSplitHandle(
+                onBegan: { splitDragOrigin = splitFraction },
+                onDragged: { translation in
+                    guard let origin = splitDragOrigin else { return }
+                    splitFraction =
+                        ExtensionDetailSplit(fraction: origin).dragged(
+                            by: translation, in: width, minimumList: minimumList,
+                            minimumDetail: minimumDetail, divider: divider
+                        ).fraction
+                },
+                onEnded: {
+                    guard splitDragOrigin != nil else { return }
+                    splitDragOrigin = nil
+                    splitStore.set(splitFraction)
+                },
+                onReset: {
+                    splitDragOrigin = nil
+                    splitFraction = ExtensionDetailSplit.standard.fraction
+                    splitStore.set(splitFraction)
+                }
+            )
+            .frame(width: handleWidth)
+            .frame(maxHeight: .infinity)
+            .offset(x: handleX)
         }
     }
 
