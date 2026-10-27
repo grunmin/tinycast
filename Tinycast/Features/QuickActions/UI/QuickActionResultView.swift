@@ -38,8 +38,11 @@ struct QuickActionResultView: View {
         .overlay(alignment: .top) { measured(header) { headerHeight = $0 } }
         .overlay(alignment: .bottom) { measured(footer) { footerHeight = $0 } }
         .frame(width: metrics.size.quickActionPanel, height: panelHeight)
-        .background(Theme.Colors.panelScrim)
-        .background(GlassEffectView())
+        .background(Theme.Colors.panelSurface)
+        .overlay {
+            RoundedRectangle(cornerRadius: metrics.radius.dialog, style: .continuous)
+                .strokeBorder(Theme.Colors.border, lineWidth: Theme.Size.hairline)
+        }
         .clipShape(RoundedRectangle(cornerRadius: metrics.radius.dialog, style: .continuous))
         // Reported, not measured: the frame above is ours, so reading it back would feed itself.
         .onChange(of: panelHeight, initial: true) { onHeight(panelHeight) }

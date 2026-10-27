@@ -59,8 +59,8 @@ struct DialogView: View {
         }
         .padding(metrics.spacing.dialogInset)
         .frame(width: width, alignment: .leading)
-        .background(Theme.Colors.panelScrim, in: shape)
-        .glassEffect(.regular, in: shape)
+        .background(Theme.Colors.panelSurface, in: shape)
+        .overlay { shape.strokeBorder(Theme.Colors.border, lineWidth: Theme.Size.hairline) }
     }
 
     @ViewBuilder private var actions: some View {

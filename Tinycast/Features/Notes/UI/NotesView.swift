@@ -9,8 +9,11 @@ struct NotesView: View {
             content
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.Colors.panelScrim)
-        .background(GlassEffectView())
+        .background(Theme.Colors.panelSurface)
+        .overlay {
+            RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
+                .strokeBorder(Theme.Colors.border, lineWidth: Theme.Size.hairline)
+        }
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous))
         // The band above is the title bar; AppKit must not inset the content a second time.
         .ignoresSafeArea()

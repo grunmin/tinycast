@@ -339,8 +339,7 @@ struct RootPaletteView: View {
                 )
                 // The window's frame is the size source, so the glass and clip stay matched.
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .background(Theme.Colors.panelScrim)
-                .background(GlassEffectView())
+                .background(Theme.Colors.panelSurface)
                 .overlay {
                     Theme.Colors.dialogDimming
                         .opacity(core.isDimmingPaletteForDialog ? 1 : 0)
@@ -352,6 +351,11 @@ struct RootPaletteView: View {
                             ? Theme.Duration.dialogEnter : Theme.Duration.dialogExit),
                     value: core.isDimmingPaletteForDialog
                 )
+                // The page is flat now, so its edge has to be stated rather than read off glass.
+                .overlay {
+                    RoundedRectangle(cornerRadius: metrics.radius.panel, style: .continuous)
+                        .strokeBorder(Theme.Colors.border, lineWidth: Theme.Size.hairline)
+                }
                 .clipShape(RoundedRectangle(cornerRadius: metrics.radius.panel, style: .continuous))),
             selection: sel)
     }

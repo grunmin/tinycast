@@ -388,6 +388,9 @@ enum Theme {
 
         /// The ramp's inverse: the scrim darkens the dark surface and lightens the light one.
         static let panelScrim = adaptive(dark: .srgbInk(0, alpha: 0.40), light: .srgbInk(1, alpha: 0.55))
+        /// The palette's own page: opaque, so an answer is read on a surface rather than through
+        /// a wallpaper. It composites to what `panelScrim` over the panel's glass used to.
+        static let panelSurface = adaptive(dark: .srgbInk(0.12, alpha: 1), light: .srgbInk(0.945, alpha: 1))
         static let dialogDimming = adaptive(
             dark: .srgbInk(0, alpha: 0.34), light: .srgbInk(0, alpha: 0.34))
         /// Find's marks, the Mac's own yellow: every match faint, the current one solid.
