@@ -42,6 +42,7 @@ private enum ExtensionMarkdownStyle {
         _ metrics: InterfaceMetrics
     ) -> CGFloat {
         guard let previous else { return 0 }
+        if case .caption = block { return metrics.spacing.md }
         if case .rule = block { return metrics.spacing.xl }
         if case .rule = previous { return metrics.spacing.xl }
         if case .heading(let level, _) = block {
@@ -81,10 +82,15 @@ private struct ExtensionMarkdownBlockView: View {
                 .lineSpacing(metrics.scaled(ExtensionMarkdownGeometry.bodyLeading))
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
+        case .caption(let text):
+            Text(text)
+                .font(metrics.typography.keyCap)
+                .foregroundStyle(Theme.Colors.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
         case .bulletList(let items):
-            ExtensionMarkdownListView(items: items, start: nil)
+            ExtensionMarkdownListView(items: items, start: nil, style: style)
         case .numberedList(let start, let items):
-            ExtensionMarkdownListView(items: items, start: start)
+            ExtensionMarkdownListView(items: items, start: start, style: style)
         case .code(let language, let text):
             ExtensionMarkdownCodeCard(language: language, text: text)
         case .quote(let blocks):
@@ -107,9 +113,18 @@ private struct ExtensionMarkdownListView: View {
     let items: [ExtensionMarkdown.Block.Item]
     /// Nil for a bulleted list; otherwise the number the first item counts from.
     let start: Int?
+    let style: ExtensionMarkdownStyle
+
+    /// A document's items take an item's air; a nested run stays tight so it reads as one list.
+    private var spacing: CGFloat {
+        switch style {
+        case .document: metrics.spacing.sm
+        case .nested: metrics.spacing.xs
+        }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: metrics.spacing.xs) {
+        VStack(alignment: .leading, spacing: spacing) {
             ForEach(Array(items.enumerated()), id: \.offset) { offset, item in
                 HStack(alignment: .firstTextBaseline, spacing: metrics.spacing.xs) {
                     marker(at: offset, checked: item.checked)
@@ -355,13 +370,18 @@ private struct ExtensionMarkdownTableView: View {
 
 /// Inline markdown for one block. `Text` renders emphasis on its own but not code or strikethrough.
 private enum ExtensionMarkdownInline {
+    /// Tags a Detail's markdown carries that `AttributedString` would otherwise print as words.
+    private static let knownTags: Set<String> = [
+        "sub", "sup", "b", "strong", "i", "em", "u", "small", "span", "br", "br/"
+    ]
+
     static func attributed(_ source: String, _ metrics: InterfaceMetrics) -> AttributedString {
         var options = AttributedString.MarkdownParsingOptions()
         options.interpretedSyntax = .inlineOnlyPreservingWhitespace
         options.failurePolicy = .returnPartiallyParsedIfPossible
         var text =
-            (try? AttributedString(markdown: source, options: options))
-            ?? AttributedString(source)
+            (try? AttributedString(markdown: strippingInlineTags(source), options: options))
+            ?? AttributedString(strippingInlineTags(source))
         let intents = text.runs.compactMap { run in
             run.inlinePresentationIntent.map { ($0, run.range) }
         }
@@ -373,6 +393,38 @@ private enum ExtensionMarkdownInline {
             if intent.contains(.strikethrough) { text[range].strikethroughStyle = .single }
         }
         return text
+    }
+
+    /// Drops a known inline tag and keeps what it wrapped; anything that only looks like one
+    /// (`a < b`, `Array<String>`) stays, since a miss here would eat a word.
+    private static func strippingInlineTags(_ source: String) -> String {
+        guard source.contains("<"), source.contains(">") else { return source }
+        var output = ""
+        var index = source.startIndex
+        while index < source.endIndex {
+            guard let open = source[index...].firstIndex(of: "<"),
+                let close = source[open...].firstIndex(of: ">"), close > open
+            else {
+                output += source[index...]
+                break
+            }
+            output += source[index..<open]
+            let tag = source[source.index(after: open)..<close]
+            if knownTags.contains(tagName(tag)) {
+                index = source.index(after: close)
+            } else {
+                output += source[open...close]
+                index = source.index(after: close)
+            }
+        }
+        return output
+    }
+
+    private static func tagName(_ tag: Substring) -> String {
+        var name = tag.drop(while: { $0 == "/" })
+        guard let first = name.first, first.isLetter else { return "" }
+        name = name.prefix(while: { $0.isLetter || $0.isNumber })
+        return name.lowercased()
     }
 
     static func headingFont(_ level: Int, _ metrics: InterfaceMetrics) -> Font {
@@ -392,7 +444,7 @@ private enum ExtensionMarkdownGeometry {
     static let heading3: CGFloat = 15
     static let blockSpace: CGFloat = 11
     static let headingSpace: CGFloat = 14
-    static let bodyLeading: CGFloat = 2.5
+    static let bodyLeading: CGFloat = 4
     static let codeLeading: CGFloat = 2
     static let tableCellLeading: CGFloat = 2
     static let tableCellInset: CGFloat = 5

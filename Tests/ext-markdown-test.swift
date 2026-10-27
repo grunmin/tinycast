@@ -28,6 +28,7 @@ struct ExtensionMarkdownTests {
         quotes()
         rules()
         images()
+        captions()
         truncatedInput()
 
         if failures > 0 {
@@ -267,6 +268,17 @@ struct ExtensionMarkdownTests {
         expect(
             parse("![unsized](http)") == [.paragraph("![unsized](http)")],
             "a scheme with no host stays text")
+    }
+
+    static func captions() {
+        expect(
+            parse("<sub>deepseek-chat · 4.2s</sub>") == [.caption("deepseek-chat · 4.2s")],
+            "an extension's sub footer becomes a caption")
+        expect(parse("<SUP>2</SUP>") == [.caption("2")], "sup counts too, whatever its case")
+        expect(
+            parse("<sub>a</sub> plain") == [.paragraph("<sub>a</sub> plain")],
+            "a tag inside a sentence stays with the paragraph")
+        expect(parse("a < b and c > d") == [.paragraph("a < b and c > d")], "prose angle brackets stay")
     }
 
     static func truncatedInput() {

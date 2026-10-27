@@ -5,6 +5,8 @@ enum ExtensionMarkdown {
     enum Block: Equatable, Sendable {
         case heading(level: Int, text: String)
         case paragraph(String)
+        /// A `<sub>`/`<sup>` line on its own: the footer an extension closes a Detail with.
+        case caption(String)
         case bulletList([Item])
         case numberedList(start: Int, items: [Item])
         case code(language: String?, text: String)
@@ -65,6 +67,9 @@ enum ExtensionMarkdown {
                 } else if let url = Line.imageURL(line) {
                     index += 1
                     blocks.append(.image(url))
+                } else if let caption = Line.caption(line) {
+                    index += 1
+                    blocks.append(.caption(caption))
                 } else if let paragraph = paragraph() {
                     blocks.append(paragraph)
                 }
@@ -189,6 +194,19 @@ private enum Line {
     }
 
     static func isBlank(_ line: String) -> Bool { line.allSatisfy(\.isWhitespace) }
+
+    /// A line that is nothing but `<sub>…</sub>` or `<sup>…</sup>`, which is how an extension
+    /// signs a Detail with its model and latency; the tags are markup, not words.
+    static func caption(_ line: String) -> String? {
+        let text = line.trimmingCharacters(in: .whitespaces)
+        let lowered = text.lowercased()
+        for (open, close) in [("<sub>", "</sub>"), ("<sup>", "</sup>")]
+        where lowered.hasPrefix(open) && lowered.hasSuffix(close) && text.count > open.count + close.count {
+            return String(text.dropFirst(open.count).dropLast(close.count))
+                .trimmingCharacters(in: .whitespaces)
+        }
+        return nil
+    }
 
     /// Leading whitespace measured in characters, so it also indexes back into the line.
     static func indent(_ line: String) -> Int { line.prefix(while: { $0 == " " || $0 == "\t" }).count }
