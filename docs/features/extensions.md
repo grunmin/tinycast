@@ -274,9 +274,14 @@ screens hold (see [palette.md](palette.md)).
   since the grid draws one column count throughout.
   A tile may be a bare `{color}` swatch instead of an image, stated in any notation `ColorValue`
   reads — a colour picker writes `oklch()`, not hex.
-- **Detail** — markdown rendered block-by-block (headings, lists, code fences, quotes, rules, tables, fetched
-  and inline images) with `AttributedString` handling inline styling, plus `Detail.Metadata` — a
-  sidebar on a Detail screen, appended below the markdown in a `List`'s detail pane. An image
+- **Detail** — markdown is parsed into blocks by `ExtensionMarkdown` and drawn by
+  `ExtensionMarkdownView` as a document: a stepped heading hierarchy, hanging-indent bullet, numbered
+  and task lists that keep their nesting, soft-wrapped code cards carrying their fence's language,
+  quotes whose bar ends with their text, borderless tables that honour GFM column alignment and ragged
+  rows, rules, and both fetched and inline images. Inline emphasis, code chips, strikethrough and links
+  come from `AttributedString`; the parser tolerates a reply still streaming in, since a Detail
+  re-renders on every chunk. `Detail.Metadata` is the metadata sidebar on a Detail screen, appended
+  below the markdown in a `List`'s detail pane. An image
   draws at its own size, shrunk to fit the pane and never enlarged, unless `?raycast-width=` /
   `?raycast-height=` on its URL, read by `ExtensionImageSize`, size it. A rowless Detail's screen
   actions remain available through the primary ⏎ action and the ⌘K Actions panel.
