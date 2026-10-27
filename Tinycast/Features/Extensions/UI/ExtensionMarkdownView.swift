@@ -156,12 +156,16 @@ private struct ExtensionMarkdownCodeCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: metrics.spacing.sm) {
-            if let language, !language.isEmpty {
-                Text(language)
-                    .font(metrics.typography.keyCap)
-                    .foregroundStyle(Theme.Colors.textTertiary)
+            HStack(spacing: metrics.spacing.md) {
+                if let language, !language.isEmpty {
+                    Text(language)
+                        .font(metrics.typography.keyCap)
+                        .foregroundStyle(Theme.Colors.textTertiary)
+                }
+                Spacer(minLength: 0)
+                ExtensionMarkdownCopyButton(text: text)
             }
-            Text(verbatim: text)
+            Text(ExtensionMarkdownSyntax.attributed(text, language: language, metrics))
                 .font(metrics.typography.code)
                 .lineSpacing(metrics.scaled(ExtensionMarkdownGeometry.codeLeading))
                 .fixedSize(horizontal: false, vertical: true)
@@ -169,7 +173,8 @@ private struct ExtensionMarkdownCodeCard: View {
                 .textSelection(.enabled)
         }
         .padding(.horizontal, metrics.spacing.xl)
-        .padding(.vertical, metrics.spacing.lg)
+        .padding(.top, metrics.spacing.sm)
+        .padding(.bottom, metrics.spacing.lg)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: metrics.radius.card, style: .continuous)
@@ -179,6 +184,82 @@ private struct ExtensionMarkdownCodeCard: View {
             RoundedRectangle(cornerRadius: metrics.radius.card, style: .continuous)
                 .stroke(Theme.Colors.cardStroke)
         )
+    }
+}
+
+/// A code card's copy affordance, as AI replies draw one: the answer is usually the code.
+private struct ExtensionMarkdownCopyButton: View {
+    @Environment(\.metrics) private var metrics
+    let text: String
+
+    /// The stamp is the copy event: a fresh one re-arms the reset, so a second tap holds the check.
+    @State private var copiedAt: Date?
+
+    private var copied: Bool { copiedAt != nil }
+
+    var body: some View {
+        Button {
+            Paster.copyPlainText(text)
+            copiedAt = Date()
+        } label: {
+            SymbolImage(name: copied ? "checkmark" : "square.on.square", size: metrics.scaled(11))
+                .foregroundStyle(copied ? Theme.Colors.success : Theme.Colors.textSecondary)
+                .frame(width: metrics.size.chatMessageAction, height: metrics.size.chatMessageAction)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        // The palette's search field keeps first responder; a click here must not take it.
+        .focusable(false)
+        .help(copied ? String(localized: "Copied") : String(localized: "Copy Code"))
+        .accessibilityLabel(copied ? String(localized: "Copied") : String(localized: "Copy Code"))
+        .task(id: copiedAt) {
+            guard copied else { return }
+            try? await Task.sleep(for: .seconds(Theme.Duration.copyFeedback))
+            copiedAt = nil
+        }
+    }
+}
+
+/// A fenced block's ink, from the same lexer the AI transcript paints with.
+private enum ExtensionMarkdownSyntax {
+    static func attributed(
+        _ code: String, language: String?, _ metrics: InterfaceMetrics
+    ) -> AttributedString {
+        var output = AttributedString()
+        let source = code as NSString
+        var cursor = 0
+        // Tokens are non-overlapping UTF-16 ranges, so the block is spliced once, in order.
+        for token in SyntaxHighlighter.tokens(in: code, language: language) {
+            let range = token.range
+            guard range.location >= cursor, NSMaxRange(range) <= source.length else { continue }
+            if range.location > cursor {
+                output.append(
+                    AttributedString(
+                        source.substring(with: NSRange(location: cursor, length: range.location - cursor))))
+            }
+            var piece = AttributedString(source.substring(with: range))
+            piece.foregroundColor = color(token.kind)
+            output.append(piece)
+            cursor = NSMaxRange(range)
+        }
+        if cursor < source.length { output.append(AttributedString(source.substring(from: cursor))) }
+        return output
+    }
+
+    private static func color(_ kind: SyntaxKind) -> Color {
+        switch kind {
+        case .keyword: Theme.Colors.Syntax.keyword
+        case .string: Theme.Colors.Syntax.string
+        case .number: Theme.Colors.Syntax.number
+        case .comment: Theme.Colors.Syntax.comment
+        case .type: Theme.Colors.Syntax.type
+        case .function: Theme.Colors.Syntax.function
+        case .constant: Theme.Colors.Syntax.constant
+        case .attribute: Theme.Colors.Syntax.attribute
+        case .property: Theme.Colors.Syntax.property
+        case .inserted: Theme.Colors.Syntax.inserted
+        case .deleted: Theme.Colors.Syntax.deleted
+        }
     }
 }
 
@@ -205,32 +286,37 @@ private struct ExtensionMarkdownTableView: View {
     let table: ExtensionMarkdown.Block.Table
 
     var body: some View {
-        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 0, verticalSpacing: 0) {
+        Grid(
+            alignment: .leadingFirstTextBaseline, horizontalSpacing: metrics.spacing.xl,
+            verticalSpacing: metrics.spacing.sm
+        ) {
             header
             hairline(Theme.Colors.cardStroke)
-            ForEach(Array(table.rows.enumerated()), id: \.offset) { offset, row in
+            ForEach(Array(table.rows.enumerated()), id: \.offset) { _, row in
                 bodyRow(row)
-                if offset < table.rows.count - 1 {
-                    hairline(Theme.Colors.cardStroke.opacity(0.6))
-                }
             }
         }
         // Given only a width, Grid measures a wrapping row a line short of what it draws.
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(metrics.spacing.xl)
         .background(
             RoundedRectangle(cornerRadius: metrics.radius.card, style: .continuous)
                 .fill(Theme.Colors.cardFill)
         )
-        .clipShape(RoundedRectangle(cornerRadius: metrics.radius.card, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: metrics.radius.card, style: .continuous)
+                .stroke(Theme.Colors.cardStroke)
+        )
     }
 
     private var header: some View {
         GridRow {
             ForEach(Array(table.header.enumerated()), id: \.offset) { column, cell in
-                cellView(cell)
+                Text(ExtensionMarkdownInline.attributed(cell, metrics))
                     .font(metrics.typography.sectionHeader)
                     .foregroundStyle(Theme.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: alignment(at: column))
             }
         }
@@ -239,19 +325,13 @@ private struct ExtensionMarkdownTableView: View {
     private func bodyRow(_ row: [String]) -> some View {
         GridRow {
             ForEach(Array(row.enumerated()), id: \.offset) { column, cell in
-                cellView(cell)
+                Text(ExtensionMarkdownInline.attributed(cell, metrics))
                     .font(metrics.typography.rowTitle)
                     .lineSpacing(metrics.scaled(ExtensionMarkdownGeometry.tableCellLeading))
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: alignment(at: column))
             }
         }
-    }
-
-    private func cellView(_ source: String) -> some View {
-        Text(ExtensionMarkdownInline.attributed(source, metrics))
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(.horizontal, metrics.spacing.md)
-            .padding(.vertical, metrics.scaled(ExtensionMarkdownGeometry.tableCellInset))
     }
 
     private func hairline(_ color: Color) -> some View {
