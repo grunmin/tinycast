@@ -49,8 +49,8 @@ Full detail in [architecture.md](architecture.md); the rules a new feature has t
   the filesystem, the home directory, the rates table. This is the enforced rule below.
 - New long-lived state belongs on `AppCore`, wired in `start()`. Do not create a second singleton.
 - A Settings pane lives with its feature. Only a pane no feature owns lives in `Settings/Panes/`.
-- Shared visual primitives go in `DesignSystem/`, system shims in `Platform/`. Neither may depend on a
-  feature.
+- Shared visual primitives go in `DesignSystem/`, system shims and Foundation utilities in
+  `Platform/` (`Compression/`, `Syntax/`). Neither may depend on a feature.
 
 Feature work reaches the app through a **coordinator**, called by `AppCore` and by views via
 `@Environment`. Confirmation gates live in the coordinator, never in the runner — which is what lets

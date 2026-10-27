@@ -749,18 +749,18 @@ run chat-markdown-test     Tinycast/Platform/Appearance.swift \
                            Tinycast/Features/AI/Model/MathFormula.swift \
                            Tinycast/Features/AI/Model/MathNode.swift \
                            Tinycast/Features/AI/Model/MathSymbolCatalog.swift \
-                           Tinycast/Features/AI/Model/SyntaxGrammar.swift \
-                           Tinycast/Features/AI/Model/SyntaxHighlighter.swift \
-                           Tinycast/Features/AI/Model/SyntaxStructuredLexers.swift \
+                           Tinycast/Platform/Syntax/SyntaxGrammar.swift \
+                           Tinycast/Platform/Syntax/SyntaxHighlighter.swift \
+                           Tinycast/Platform/Syntax/SyntaxStructuredLexers.swift \
                            Tinycast/Features/AI/UI/ChatTextHighlight.swift \
                            Tinycast/Features/AI/UI/ChatMarkdownRenderer.swift \
                            Tinycast/Features/AI/UI/MathAttachmentCell.swift \
                            Tinycast/Features/AI/UI/MathBox.swift \
                            Tinycast/Features/AI/UI/MathFont.swift \
                            Tinycast/Features/AI/UI/MathLayoutEngine.swift
-run syntax-highlight-test  Tinycast/Features/AI/Model/SyntaxGrammar.swift \
-                           Tinycast/Features/AI/Model/SyntaxHighlighter.swift \
-                           Tinycast/Features/AI/Model/SyntaxStructuredLexers.swift
+run syntax-highlight-test  Tinycast/Platform/Syntax/SyntaxGrammar.swift \
+                           Tinycast/Platform/Syntax/SyntaxHighlighter.swift \
+                           Tinycast/Platform/Syntax/SyntaxStructuredLexers.swift
 run mcp-test               Tinycast/Features/Settings/AppSettingsKey.swift \
                            Tinycast/Features/AI/Model/AIConnection.swift \
                            Tinycast/Features/AI/Model/AppleIntelligence.swift \

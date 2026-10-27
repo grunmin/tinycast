@@ -229,7 +229,8 @@ Tinycast/
   Platform/         system shims: Permissions, LaunchAtLogin, InputSourceSwitcher, ScreenTarget,
                     AppDisplayName,
                     NotificationToken, AppPaths, Signposts, HealthTicker, Memo, ActivationPolicy,
-                    Images/, Compression/
+                    Images/, Compression/, Syntax/ (the lexer AI replies and
+                    extension Details share)
   Resources/        RaycastRuntime.generated.js, the embedded extension runtime
   Palette/          the palette shell: PalettePanel, PaletteWindowController, RootPaletteView,
                     the PaletteScreen protocol, PaletteCoordinator, PaletteState, PaletteMode
